@@ -311,8 +311,11 @@ function New-Card($t, [int]$w, [string]$color, [bool]$plain) {
     $task = if ($plain) { '' } else { Get-Task $t }
     if (-not $task) { $task = '—' }
     $lines = @('│ ' + (Format-Cells $task $in) + ' │')
-    # Last output lines, dimmer than the card; padded so every card is the same height.
-    $tail = if ($st -and -not $plain) { @($st.Tail) } else { @() }
+    # Last output lines, dimmer than the card, only while the agent is busy or
+    # waiting for you (WORKING, NEEDS YOU); DONE cards are shorter without them.
+    $busy = -not $plain -and $t.state -eq 'live' -and (Get-ShownStatus $t) -in 'working', 'blocked', 'error'
+    $tail = if ($st -and $busy) { @($st.Tail) } else { @() }
+    $tailRows = if ($busy) { $TailLines } else { 0 }
     # Status on the left, timer on the right.
     $timer = if ($age) { "⏱ $age" } else { '' }
     $left = Limit-End $status ([math]::Max(0, $in - $timer.Length - 1))
@@ -320,7 +323,7 @@ function New-Card($t, [int]$w, [string]$color, [bool]$plain) {
     $bottom = '└' + ('─' * ($w - 2)) + '┘'
 
     @($top) + $lines | ForEach-Object { @{ Text = $_; Color = $c } }
-    for ($k = 0; $k -lt $TailLines; $k++) {
+    for ($k = 0; $k -lt $tailRows; $k++) {
         $text = if ($k -lt $tail.Count) { '  ' + $tail[$k] } else { '' }
         # Inner: drawn in its own colour between the card's borders.
         @{ Text = '│ ' + (Format-Cells $text $in) + ' │'; Color = $c; Inner = $text; InnerColor = 'DarkGray' }
@@ -379,11 +382,17 @@ function Show-Board([bool]$live, $terms) {
         $col = $columns[$i]
         $items = $buckets[$i]
         $lines = @(@{ Text = "$($col.Title) ($($items.Count))"; Color = $col.Color })
-        $fit = [math]::Floor(($cardRows - 1) / $cardH)
-        if ($items.Count -le [math]::Floor($cardRows / $cardH)) { $fit = $items.Count }
-        foreach ($t in ($items | Select-Object -First $fit)) {
-            $plain = (Get-ColumnIndex $t) -eq -1
-            $lines += New-Card $t $cardW $col.Color $plain
+        # Cards differ in height: add them while they fit, keeping a row for "+N more".
+        $fit = 0
+        $used = 0
+        for ($k = 0; $k -lt $items.Count; $k++) {
+            $plain = (Get-ColumnIndex $items[$k]) -eq -1
+            $card = @(New-Card $items[$k] $cardW $col.Color $plain)
+            $room = if ($k -eq $items.Count - 1) { $cardRows } else { $cardRows - 1 }
+            if ($used + $card.Count -gt $room) { break }
+            $lines += $card
+            $used += $card.Count
+            $fit++
         }
         if ($items.Count -gt $fit) { $lines += @{ Text = "  +$($items.Count - $fit) more"; Color = 'DarkGray' } }
         if ($items.Count -eq 0) { $lines += @{ Text = '  —'; Color = 'DarkGray' } }
