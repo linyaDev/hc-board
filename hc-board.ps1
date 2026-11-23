@@ -57,6 +57,26 @@ $script:boardStartMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
 $script:stamps = @{}
 $cardH = 4 + $TailLines   # lines per card
 
+# Last request per terminal survives board restarts: a busy agent's request has
+# often scrolled off its screen by then, and hc gives only the screen while it works.
+# Key: "<address>@<created_ms>", so a reused address doesn't inherit an old request.
+$script:promptFile = Join-Path $env:LOCALAPPDATA 'hc-board\prompts.json'
+$script:prompts = @{}
+try {
+    if (Test-Path $script:promptFile) {
+        $j = [IO.File]::ReadAllText($script:promptFile, [Text.Encoding]::UTF8) | ConvertFrom-Json
+        foreach ($p in $j.PSObject.Properties) { $script:prompts[$p.Name] = [string]$p.Value }
+    }
+} catch {}
+
+function Save-Prompts {
+    try {
+        $dir = Split-Path $script:promptFile
+        if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Force $dir | Out-Null }
+        [IO.File]::WriteAllText($script:promptFile, ($script:prompts | ConvertTo-Json -Compress), [Text.UTF8Encoding]::new($false))
+    } catch {}
+}
+
 function Get-Terminals {
     $raw = (& $hc ls --all --json 2>$null) -join "`n"
     if ($LASTEXITCODE -or -not $raw.Trim()) { return $null }
@@ -159,20 +179,29 @@ function Update-Stamps($terms) {
             $g = (& $hc get $t.address --json 2>$null) -join "`n" | ConvertFrom-Json
             if (-not $g) { continue }
             $old = $script:stamps[$t.address]
-            $prompt = if ($old) { $old.Prompt } else { '' }
+            $key = "$($t.address)@$($g.created_ms)"
+            $prompt = if ($old -and $old.Prompt) { $old.Prompt } else { [string]$script:prompts[$key] }
             $tail = if ($old) { $old.Tail } else { @() }
             $app = if ($g.status -and $g.status.PSObject.Properties['app']) { [string]$g.status.app } else { [string]$t.agent }
-            if (-not $old -or $old.Turn -ne $t.turn -or $old.Status -ne $name -or -not $prompt) {
-                $lines = @(& $hc read $t.address --lines 60 2>$null)
-                $prompt = Get-LastPrompt $t.address $app $lines
+            if (-not $old -or $old.Turn -ne $t.turn -or $old.Status -ne $name -or -not $old.Found) {
+                $lines = @(& $hc read $t.address --lines 200 2>$null)
+                $found = Get-LastPrompt $t.address $app $lines
                 $tail = Get-ScreenTail $lines $app $TailLines
+                # Keep the last known request until a newer one shows up on screen.
+                if ($found -and $found -ne $prompt) {
+                    $prompt = $found
+                    $script:prompts[$key] = $found
+                    Save-Prompts
+                }
             }
+            else { $found = $old.Found }
             $script:stamps[$t.address] = @{
                 Status = $name
                 Turn   = $t.turn
                 Ms     = if ($g.status_ms) { [int64]$g.status_ms } else { [int64]0 }
                 Title  = Get-TaskTitle ([string]$g.title) $t
                 Prompt = $prompt
+                Found  = [bool]$found   # seen on screen this turn; else re-read next reload
                 Tail   = $tail
                 App    = $app
                 Role   = if ($g.labels -and $g.labels.PSObject.Properties['role']) { [string]$g.labels.role } else { '' }
@@ -182,12 +211,12 @@ function Update-Stamps($terms) {
     foreach ($k in @($script:stamps.Keys)) { if (-not $seen[$k]) { $script:stamps.Remove($k) } }
 }
 
-# Last message sent to the agent; the session title when none is on screen.
+# Last message sent to the agent. Not the terminal title: agents set that from
+# the session's first message, so it reads like the first request, not the last.
 function Get-Task($t) {
     $s = $script:stamps[$t.address]
     if (-not $s) { return '' }
-    if ($s.Prompt) { return $s.Prompt }
-    $s.Title
+    $s.Prompt
 }
 
 function Test-Crashed($t) {
