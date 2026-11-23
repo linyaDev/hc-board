@@ -1,0 +1,72 @@
+{
+    // Copy to <workspace>/.vscode/tasks.json and set HC_BOARD below to where this repo lives.
+    // Each tab is a window onto an hc terminal: hc-agent.ps1 attaches to the named
+    // terminal, starting it first if it isn't running. ctrl+\ detaches a tab.
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "Board",
+            "type": "process",
+            "icon": { "id": "project", "color": "terminal.ansiWhite" },
+            "command": "powershell.exe",
+            "args": [
+                "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "D:/HC_BOARD/hc-agent.ps1",
+                "board", "${workspaceFolder}",
+                "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "D:/HC_BOARD/hc-board.ps1"
+            ],
+            "runOptions": { "runOn": "folderOpen" },
+            "isBackground": true,
+            "problemMatcher": [],
+            "presentation": { "echo": false, "reveal": "always", "panel": "dedicated", "focus": false, "showReuseMessage": false, "clear": false }
+        },
+        {
+            "label": "Claude",
+            "type": "process",
+            "icon": { "id": "sparkle", "color": "terminal.ansiYellow" },
+            "command": "powershell.exe",
+            "args": [
+                "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "D:/HC_BOARD/hc-agent.ps1",
+                "--role", "lead", "main-claude", "${workspaceFolder}",
+                "claude", "--continue"
+            ],
+            "runOptions": { "runOn": "folderOpen" },
+            "isBackground": true,
+            "problemMatcher": [],
+            "presentation": { "echo": false, "reveal": "always", "panel": "dedicated", "focus": true, "showReuseMessage": false, "clear": false }
+        },
+        {
+            // A second Claude in the same folder: --continue would open the first one's
+            // session, so it resumes its own. Create it once with --session-id <uuid>,
+            // send it a message, then put the same id here.
+            "label": "Claude (coder)",
+            "type": "process",
+            "icon": { "id": "code", "color": "terminal.ansiYellow" },
+            "command": "powershell.exe",
+            "args": [
+                "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "D:/HC_BOARD/hc-agent.ps1",
+                "--role", "coder", "main-coder", "${workspaceFolder}",
+                "claude", "--resume", "<session-uuid>",
+                "--append-system-prompt", "You are the coder (main-coder). Hand other work to main-claude with hc send."
+            ],
+            "runOptions": { "runOn": "folderOpen" },
+            "isBackground": true,
+            "problemMatcher": [],
+            "presentation": { "echo": false, "reveal": "always", "panel": "dedicated", "focus": false, "showReuseMessage": false, "clear": false }
+        },
+        {
+            "label": "Codex",
+            "type": "process",
+            "icon": { "id": "terminal", "color": "terminal.ansiGreen" },
+            "command": "powershell.exe",
+            "args": [
+                "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "D:/HC_BOARD/hc-agent.ps1",
+                "main-codex", "${workspaceFolder}",
+                "codex", "resume", "--last", "--no-daemon"
+            ],
+            "runOptions": { "runOn": "folderOpen" },
+            "isBackground": true,
+            "problemMatcher": [],
+            "presentation": { "echo": false, "reveal": "always", "panel": "dedicated", "focus": false, "showReuseMessage": false, "clear": false }
+        }
+    ]
+}
