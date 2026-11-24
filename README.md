@@ -3,6 +3,8 @@
 Живая доска AI-агентов, запущенных через [herdr-core](https://herdr.dev) (`hc`), и запуск агентов
 из вкладок VS Code. Windows, PowerShell 5.1+.
 
+**macOS:** доска как мод [Herdr](https://herdr.dev) и запуск агентов вкладками Herdr — см. [`mac/`](mac/README.md).
+
 ```
 NEEDS YOU (1)                WORKING (1)                        DONE (2)
 ┌ Mods - claude ──────────┐  ┌ DragonGame - claude - аниматор ┐  ┌ DragonGame - codex ─────┐
