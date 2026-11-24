@@ -4,15 +4,29 @@
 Mac port of hc-agent.ps1 + .vscode/tasks.json from github.com/linyaDev/hc-board.
 Like VS Code's "runOn: folderOpen": agents already running are left alone,
 missing ones are started with `hc run --keep`, so they outlive Herdr and the
-next call finds them again. They land in the project's Herdr space (the one
-whose folder is <folder>, else a new one) and the board gets a tab there.
+next call finds them again. Each agent gets its own tab; by default they share
+the project's Herdr space (the one whose folder is <folder>, else a new one).
+The board gets a tab in the first agent's space.
 
 The team comes from <folder>/.herdr/team.json:
 
   { "board": true,
     "agents": [
       { "name": "main-claude", "role": "lead",  "run": ["claude", "--continue"] },
-      { "name": "main-codex",                    "run": ["codex", "resume", "--last", "--no-daemon"] } ] }
+      { "name": "main-codex", "cwd": "server",   "run": ["codex", "resume", "--last", "--no-daemon"] } ] }
+
+Optional per agent:
+  "cwd"       its folder: absolute, ~/…, or relative to <folder>.
+  "space"     the Herdr space it goes to, by name: agents with the same value
+              share one, others get their own; created (and named) if missing.
+              Without it: the project's space, or the worktree's.
+  "worktree"  a branch: the agent runs in a git worktree of its repo on that
+              branch, made like Herdr's New worktree does
+              (<worktrees.directory>/<repo>/<branch>, default ~/.herdr/worktrees;
+              an existing checkout of the branch is reused; a new branch starts
+              at HEAD). Its subfolder ("cwd") is kept inside the worktree.
+              Without "space", each worktree is a space of its own, nested
+              under the repo in Herdr's sidebar.
 
 or, when that file is missing, from <folder>/.vscode/tasks.json: every task
 that calls hc-agent.ps1 is read as one agent, and one that runs hc-board.ps1
@@ -20,7 +34,7 @@ turns the board on. So the Windows projects work unchanged.
 
   --print   show the team and do nothing
 """
-import json, os, re, subprocess, sys, time, uuid
+import json, os, re, subprocess, sys, time, unicodedata, uuid
 
 
 def sh(*args, check=True):
@@ -86,6 +100,55 @@ def load_team(folder):
     raise SystemExit(f"no team: write {own} (see hc-team --help)")
 
 
+def git(cwd, *args, check=True):
+    r = subprocess.run(["git", "-C", cwd, *args], capture_output=True, text=True)
+    if check and r.returncode:
+        raise SystemExit(f"git {' '.join(args[:2])}: {r.stderr.strip() or r.stdout.strip()}")
+    return r
+
+
+def slug(branch):
+    """Herdr's folder name for a branch (mods/worktree)."""
+    name = re.sub(r"[^\w.\-]+", "-", unicodedata.normalize("NFC", branch)).strip("-")
+    if name:
+        return name
+    h = 2166136261
+    for ch in unicodedata.normalize("NFC", branch):
+        h = ((h ^ ord(ch)) * 16777619) & 0xFFFFFFFF
+    return f"branch-{h:08x}"
+
+
+def worktrees_root():
+    try:
+        d = json.load(open(os.path.expanduser("~/.config/herdr-app/settings.json"))).get("worktrees", {}).get("directory")
+    except Exception:
+        d = None
+    return os.path.expanduser(d or "~/.herdr/worktrees").rstrip("/")
+
+
+def ensure_worktree(cwd, branch):
+    """The checkout of <branch> for the repo at cwd (made if missing), and cwd moved into it."""
+    top = git(cwd, "rev-parse", "--show-toplevel").stdout.strip()
+    common = git(cwd, "rev-parse", "--path-format=absolute", "--git-common-dir").stdout.strip()
+    main_dir = os.path.dirname(common) if os.path.basename(common) == ".git" else top
+    rel = os.path.relpath(os.path.realpath(cwd), os.path.realpath(top))
+    path, current = None, None
+    for line in git(cwd, "worktree", "list", "--porcelain").stdout.splitlines():
+        if line.startswith("worktree "):
+            current = line[9:]
+        elif line == f"branch refs/heads/{branch}":
+            path = current
+    if not path:
+        path = os.path.join(worktrees_root(), os.path.basename(main_dir), slug(branch))
+        local = git(cwd, "show-ref", "--verify", "--quiet", f"refs/heads/{branch}", check=False).returncode == 0
+        remote = git(cwd, "for-each-ref", "--format=%(refname)", f"refs/remotes/*/{branch}", check=False).stdout.strip()
+        # A local or remote branch is checked out (git tracks the remote one); a new one starts at HEAD.
+        git(cwd, "worktree", "add", path, branch) if local or remote else git(cwd, "worktree", "add", "-b", branch, path, "HEAD")
+        print(f"  worktree {branch}: {path}")
+    root = os.path.realpath(path)
+    return root, os.path.normpath(os.path.join(root, rel)) if rel != "." else root
+
+
 def main():
     argv = sys.argv[1:]
     if "-h" in argv or "--help" in argv:
@@ -98,26 +161,53 @@ def main():
     if dry:
         print(f"{source}\nboard: {bool(team.get('board', True))}")
         for a in agents:
-            print(f"  {a['name']:<16} {a.get('role') or '-':<10} {' '.join(a['run'])}")
+            where = " ".join(x for x in [a.get("cwd") and f"cwd={a['cwd']}", a.get("space") and f"space={a['space']}",
+                                         a.get("worktree") and f"worktree={a['worktree']}"] if x)
+            print(f"  {a['name']:<16} {a.get('role') or '-':<10} {' '.join(a['run'])}" + (f"   [{where}]" if where else ""))
         return
 
     live = {t.get("name"): t for t in json.loads(sh("hc", "ls", "--json"))["terminals"] if t.get("name")}
-    spaces = json.loads(sh("herdr-app", "ls"))["spaces"]
-    space = next((s for s in spaces if not s.get("machine") and os.path.realpath(s.get("folder") or "") == folder), None)
-    # Agents already in a space of this project lead the way there.
-    if not space:
-        for a in agents:
-            t = live.get(a["name"])
-            if t:
-                sid = (json.loads(sh("hc", "get", t["address"], "--json")).get("labels") or {}).get("herdr.space")
-                space = next((s for s in spaces if s["id"] == sid), None)
-                if space: break
-    sid = space["id"] if space else "spa" + uuid.uuid4().hex
+    spaces = [s for s in json.loads(sh("herdr-app", "ls"))["spaces"] if not s.get("machine")]
+    by_id = {s["id"]: s for s in spaces}
+
+    # Where each agent runs and which space group it belongs to.
+    plan = []
+    for a in agents:
+        cwd = os.path.normpath(os.path.join(folder, os.path.expanduser(a.get("cwd") or ".")))
+        if not os.path.isdir(cwd):
+            print(f"  {a['name']}: no folder {cwd}, skipped"); continue
+        home = folder
+        if a.get("worktree"):
+            home, cwd = ensure_worktree(cwd, a["worktree"])
+            if not os.path.isdir(cwd):
+                cwd = home
+        key = ("name", a["space"]) if a.get("space") else ("folder", home)
+        plan.append((a, cwd, key))
+
+    # A group's space: where its running agents already are, else the space with
+    # that name / folder, else a new one (named after "space" once it exists).
+    group_space, to_name = {}, {}
+    for a, _, key in plan:
+        t = live.get(a["name"])
+        if key in group_space or not t:
+            continue
+        sid = (json.loads(sh("hc", "get", t["address"], "--json")).get("labels") or {}).get("herdr.space")
+        if sid in by_id:
+            group_space[key] = sid
+    for _, _, key in plan:
+        if key in group_space:
+            continue
+        kind, value = key
+        found = next((s for s in spaces if (s["name"] == value if kind == "name"
+                      else os.path.realpath(s.get("folder") or "") == value)), None)
+        group_space[key] = found["id"] if found else "spa" + uuid.uuid4().hex
+        if not found and kind == "name":
+            to_name[group_space[key]] = value
 
     shell = os.environ.get("SHELL", "/bin/zsh")
     started = []
-    for a in agents:
-        name, role = a["name"], a.get("role", "")
+    for a, cwd, key in plan:
+        name, role, sid = a["name"], a.get("role", ""), group_space[key]
         if name in live:
             if role:
                 sh("hc", "label", name, f"role={role}", check=False)
@@ -134,19 +224,23 @@ def main():
         # Through the login shell, so PATH and its functions are the person's.
         cmd = [shell, "-lic", 'exec "$@"', "hc-team"] + list(a["run"])
         out = sh("hc", "run", "--bg", "--keep", "--no-parent", "--json", "--name", name, *labels,
-                 "--cwd", a.get("cwd", folder), "--", *cmd)
+                 "--cwd", cwd, "--", *cmd)
         started.append((tab, role or name))
-        print(f"  {name}: started ({json.loads(out).get('address', '?')})")
+        print(f"  {name}: started ({json.loads(out).get('address', '?')}) in {cwd}")
 
     if started:
         time.sleep(1.5)  # Herdr adopts the new terminals
         for tab, title in started:
             sh("herdr-app", "do", "tab.rename", "--id", tab, "--name", title, check=False)
-    space_now = next((s for s in json.loads(sh("herdr-app", "ls"))["spaces"] if s["id"] == sid), None)
-    if team.get("board", True) and space_now and not any(t["name"] == "Board" for t in space_now["tabs"]):
-        sh("herdr-app", "do", "tab.new", "--space", sid, "--mod", "hc-board", "--name", "Board", "--focus", "false", check=False)
-    if space_now:
-        sh("herdr-app", "do", "space.select", "--id", sid, check=False)
+    now = {s["id"]: s for s in json.loads(sh("herdr-app", "ls"))["spaces"]}
+    for sid, value in to_name.items():
+        if sid in now:
+            sh("herdr-app", "do", "space.rename", "--id", sid, "--name", value, check=False)
+    first = group_space[plan[0][2]] if plan else None
+    if team.get("board", True) and first in now and not any(t["name"] == "Board" for t in now[first]["tabs"]):
+        sh("herdr-app", "do", "tab.new", "--space", first, "--mod", "hc-board", "--name", "Board", "--focus", "false", check=False)
+    if first in now:
+        sh("herdr-app", "do", "space.select", "--id", first, check=False)
 
 
 if __name__ == "__main__":
