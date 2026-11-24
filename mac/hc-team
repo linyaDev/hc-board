@@ -1,0 +1,153 @@
+#!/usr/bin/env python3
+"""hc-team [folder] — start a project's agents in Herdr, each in its own tab.
+
+Mac port of hc-agent.ps1 + .vscode/tasks.json from github.com/linyaDev/hc-board.
+Like VS Code's "runOn: folderOpen": agents already running are left alone,
+missing ones are started with `hc run --keep`, so they outlive Herdr and the
+next call finds them again. They land in the project's Herdr space (the one
+whose folder is <folder>, else a new one) and the board gets a tab there.
+
+The team comes from <folder>/.herdr/team.json:
+
+  { "board": true,
+    "agents": [
+      { "name": "main-claude", "role": "lead",  "run": ["claude", "--continue"] },
+      { "name": "main-codex",                    "run": ["codex", "resume", "--last", "--no-daemon"] } ] }
+
+or, when that file is missing, from <folder>/.vscode/tasks.json: every task
+that calls hc-agent.ps1 is read as one agent, and one that runs hc-board.ps1
+turns the board on. So the Windows projects work unchanged.
+
+  --print   show the team and do nothing
+"""
+import json, os, re, subprocess, sys, time, uuid
+
+
+def sh(*args, check=True):
+    r = subprocess.run(args, capture_output=True, text=True)
+    if check and r.returncode:
+        raise SystemExit(f"{' '.join(args[:3])}…: {r.stderr.strip() or r.stdout.strip()}")
+    return r.stdout
+
+
+def jsonc(text):
+    """JSON with // and /* */ comments and trailing commas (VS Code's)."""
+    out, i, n, s = [], 0, len(text), None
+    while i < n:
+        c = text[i]
+        if s:
+            out.append(c)
+            if c == "\\":
+                out.append(text[i + 1]); i += 1
+            elif c == s:
+                s = None
+        elif c == '"':
+            s = c; out.append(c)
+        elif text.startswith("//", i):
+            i = text.find("\n", i); i = n if i < 0 else i; continue
+        elif text.startswith("/*", i):
+            i = text.find("*/", i) + 2; continue
+        else:
+            out.append(c)
+        i += 1
+    return json.loads(re.sub(r",(\s*[}\]])", r"\1", "".join(out)))
+
+
+def from_vscode(path, folder):
+    team = {"board": False, "agents": []}
+    for task in jsonc(open(path, encoding="utf-8-sig").read()).get("tasks", []):
+        args = [str(a) for a in task.get("args", [])]
+        at = next((i for i, a in enumerate(args) if a.lower().endswith("hc-agent.ps1")), None)
+        if at is None:
+            continue
+        a = args[at + 1:]
+        role = ""
+        if len(a) >= 2 and a[0] == "--role":
+            role, a = a[1], a[2:]
+        if len(a) < 3:
+            continue
+        name, cwd, cmd = a[0], a[1], a[2:]
+        if any(x.lower().endswith("hc-board.ps1") for x in cmd):
+            team["board"] = True
+            continue
+        cwd = cwd.replace("${workspaceFolder}", folder)
+        team["agents"].append({"name": name, "role": role, "run": cmd,
+                               **({"cwd": cwd} if os.path.isdir(cwd) and cwd != folder else {})})
+    return team
+
+
+def load_team(folder):
+    own = os.path.join(folder, ".herdr", "team.json")
+    if os.path.exists(own):
+        return jsonc(open(own, encoding="utf-8-sig").read()), own
+    vs = os.path.join(folder, ".vscode", "tasks.json")
+    if os.path.exists(vs):
+        return from_vscode(vs, folder), vs
+    raise SystemExit(f"no team: write {own} (see hc-team --help)")
+
+
+def main():
+    argv = sys.argv[1:]
+    if "-h" in argv or "--help" in argv:
+        print(__doc__.strip()); return
+    dry = "--print" in argv
+    argv = [a for a in argv if a != "--print"]
+    folder = os.path.realpath(os.path.expanduser(argv[0] if argv else "."))
+    team, source = load_team(folder)
+    agents = team.get("agents", [])
+    if dry:
+        print(f"{source}\nboard: {bool(team.get('board', True))}")
+        for a in agents:
+            print(f"  {a['name']:<16} {a.get('role') or '-':<10} {' '.join(a['run'])}")
+        return
+
+    live = {t.get("name"): t for t in json.loads(sh("hc", "ls", "--json"))["terminals"] if t.get("name")}
+    spaces = json.loads(sh("herdr-app", "ls"))["spaces"]
+    space = next((s for s in spaces if not s.get("machine") and os.path.realpath(s.get("folder") or "") == folder), None)
+    # Agents already in a space of this project lead the way there.
+    if not space:
+        for a in agents:
+            t = live.get(a["name"])
+            if t:
+                sid = (json.loads(sh("hc", "get", t["address"], "--json")).get("labels") or {}).get("herdr.space")
+                space = next((s for s in spaces if s["id"] == sid), None)
+                if space: break
+    sid = space["id"] if space else "spa" + uuid.uuid4().hex
+
+    shell = os.environ.get("SHELL", "/bin/zsh")
+    started = []
+    for a in agents:
+        name, role = a["name"], a.get("role", "")
+        if name in live:
+            if role:
+                sh("hc", "label", name, f"role={role}", check=False)
+            print(f"  {name}: running ({live[name]['address']})")
+            continue
+        # A finished terminal would still hold the name.
+        for t in json.loads(sh("hc", "ls", "--all", "--json"))["terminals"]:
+            if t.get("name") == name:
+                sh("hc", "rm", t["address"], check=False)
+        tab = "tb" + uuid.uuid4().hex
+        labels = ["--label", f"herdr.space={sid}", "--label", f"herdr.tab={tab}"]
+        if role:
+            labels += ["--label", f"role={role}"]
+        # Through the login shell, so PATH and its functions are the person's.
+        cmd = [shell, "-lic", 'exec "$@"', "hc-team"] + list(a["run"])
+        out = sh("hc", "run", "--bg", "--keep", "--no-parent", "--json", "--name", name, *labels,
+                 "--cwd", a.get("cwd", folder), "--", *cmd)
+        started.append((tab, role or name))
+        print(f"  {name}: started ({json.loads(out).get('address', '?')})")
+
+    if started:
+        time.sleep(1.5)  # Herdr adopts the new terminals
+        for tab, title in started:
+            sh("herdr-app", "do", "tab.rename", "--id", tab, "--name", title, check=False)
+    space_now = next((s for s in json.loads(sh("herdr-app", "ls"))["spaces"] if s["id"] == sid), None)
+    if team.get("board", True) and space_now and not any(t["name"] == "Board" for t in space_now["tabs"]):
+        sh("herdr-app", "do", "tab.new", "--space", sid, "--mod", "hc-board", "--name", "Board", "--focus", "false", check=False)
+    if space_now:
+        sh("herdr-app", "do", "space.select", "--id", sid, check=False)
+
+
+if __name__ == "__main__":
+    main()

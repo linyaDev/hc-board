@@ -2,3 +2,6 @@
 *.ps1 text eol=crlf
 *.json text eol=crlf
 *.md text eol=lf
+
+# Mac port: Unix line endings
+mac/** text eol=lf

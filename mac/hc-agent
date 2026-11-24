@@ -1,0 +1,31 @@
+#!/bin/zsh
+# Usage: hc-agent [--role <role>] <name> <cwd> <command> [args...]
+#
+# Mac port of hc-agent.ps1 (github.com/linyaDev/hc-board).
+# Attaches this terminal to the hc terminal <name>, starting it first if it is
+# not running. Started with --outlive-parent, so closing this terminal leaves
+# the agent running; the next call attaches to it again. ctrl+\ detaches.
+# --role sets the label role=<role>, shown on the board's card
+# (hc label <name> role=... changes it later).
+set -e
+role=""
+if [[ "$1" == "--role" ]]; then role="$2"; shift 2; fi
+if (( $# < 3 )); then
+  echo "usage: hc-agent [--role <role>] <name> <cwd> <command> [args...]" >&2; exit 2
+fi
+name="$1"; cwd="$2"; shift 2
+
+state=$(hc ls --all --json | jq -r --arg n "$name" '[.terminals[] | select(.name == $n)] | map(.state) | if index("live") then "live" else "" end')
+if [[ "$state" != live ]]; then
+  # A finished terminal would still hold the name.
+  for t in $(hc ls --all --json | jq -r --arg n "$name" '.terminals[] | select(.name == $n) | .address'); do
+    hc rm "$t" >/dev/null 2>&1 || true
+  done
+  labels=()
+  [[ -n "$role" ]] && labels=(--label "role=$role")
+  hc run --bg --outlive-parent --name "$name" "${labels[@]}" --cwd "$cwd" -- \
+    "${SHELL:-/bin/zsh}" -lic 'exec "$@"' hc-agent "$@" >/dev/null || { echo "hc could not start '$name'" >&2; exit 1; }
+elif [[ -n "$role" ]]; then
+  hc label "$name" "role=$role" >/dev/null
+fi
+exec hc attach "$name"
